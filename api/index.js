@@ -10,11 +10,26 @@ const Razorpay = require('razorpay');
 // --------------------------------------------------
 if (!admin.apps.length) {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // 1. Agar poora JSON string diya gaya ho
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
+  } else if (
+    process.env.FIREBASE_PROJECT_ID &&
+    process.env.FIREBASE_CLIENT_EMAIL &&
+    process.env.FIREBASE_PRIVATE_KEY
+  ) {
+    // 2. Agar Vercel / Render par alag-alag variables set kiye ho
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+      })
+    });
   } else {
+    // 3. Fallback: Default Google Application Credentials
     admin.initializeApp({
       credential: admin.credential.applicationDefault()
     });
@@ -164,7 +179,6 @@ app.post('/payment/createOrder', authenticateUser, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid or missing amount' });
     }
 
-    // Amount converted to smallest currency unit (paise for INR)
     const amountInPaise = Math.round(amount * 100);
 
     const options = {
@@ -175,7 +189,6 @@ app.post('/payment/createOrder', authenticateUser, async (req, res) => {
 
     const razorpayOrder = await razorpay.orders.create(options);
 
-    // Record pending transaction in Firestore
     const transactionRef = db.collection('transactions').doc();
     await transactionRef.set({
       transactionId: transactionRef.id,
@@ -203,7 +216,7 @@ app.post('/payment/createOrder', authenticateUser, async (req, res) => {
 });
 
 // --------------------------------------------------
-// 3. POST /webhook/razorpay (CRITICAL WEBHOOK HANDLER)
+// 3. POST /webhook/razorpay
 // --------------------------------------------------
 app.post('/webhook/razorpay', async (req, res) => {
   try {
@@ -214,7 +227,6 @@ app.post('/webhook/razorpay', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Signature or secret unconfigured' });
     }
 
-    // HMAC Signature Verification using raw payload buffer
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
       .update(req.rawBody)
@@ -231,7 +243,6 @@ app.post('/webhook/razorpay', async (req, res) => {
       const paymentEntity = payload.payment.entity;
       const razorpayOrderId = paymentEntity.order_id;
 
-      // Find transaction associated with the order
       const txnQuery = await db.collection('transactions')
         .where('razorpayOrderId', '==', razorpayOrderId)
         .limit(1)
@@ -244,7 +255,6 @@ app.post('/webhook/razorpay', async (req, res) => {
       const txnDoc = txnQuery.docs[0];
       const txnRef = txnDoc.ref;
 
-      // Execute atomic Firestore transaction for Idempotency and Wallet Credit
       await db.runTransaction(async (transaction) => {
         const currentTxnDoc = await transaction.get(txnRef);
 
@@ -254,7 +264,6 @@ app.post('/webhook/razorpay', async (req, res) => {
 
         const txnData = currentTxnDoc.data();
 
-        // Idempotency check: Ignore already processed events
         if (txnData.status === 'SUCCESS') {
           return;
         }
@@ -270,14 +279,12 @@ app.post('/webhook/razorpay', async (req, res) => {
           throw new Error('Target user account not found');
         }
 
-        // 1. Update Transaction Status
         transaction.update(txnRef, {
           status: 'SUCCESS',
           razorpayPaymentId: paymentEntity.id,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 2. Credit User Wallet
         const currentWallet = userDoc.data().wallet || 0;
         transaction.update(userRef, {
           wallet: currentWallet + txnData.amount
@@ -324,7 +331,6 @@ app.post('/product/purchase', authenticateUser, async (req, res) => {
     const productRef = db.collection('products').doc(productId);
     const userRef = db.collection('users').doc(userId);
 
-    // Atomic transaction for purchase execution
     await db.runTransaction(async (transaction) => {
       const productDoc = await transaction.get(productRef);
       const userDoc = await transaction.get(userRef);
@@ -340,12 +346,10 @@ app.post('/product/purchase', authenticateUser, async (req, res) => {
       const productData = productDoc.data();
       const userData = userDoc.data();
 
-      // Ensure product is active
       if (productData.status !== 'active') {
         throw new Error('Product is currently inactive');
       }
 
-      // Check duplicate purchase
       const purchasedProducts = userData.purchasedProducts || [];
       if (purchasedProducts.includes(productId)) {
         throw new Error('Product already purchased');
@@ -354,24 +358,20 @@ app.post('/product/purchase', authenticateUser, async (req, res) => {
       const productPrice = productData.price || 0;
       const userWallet = userData.wallet || 0;
 
-      // Check sufficient wallet balance
       if (userWallet < productPrice) {
         throw new Error('Insufficient wallet balance');
       }
 
-      // 1. Deduct price from wallet and record ownership
       transaction.update(userRef, {
         wallet: userWallet - productPrice,
         purchasedProducts: admin.firestore.FieldValue.arrayUnion(productId)
       });
 
-      // 2. Increment product sales count
       const currentSales = productData.totalSales || 0;
       transaction.update(productRef, {
         totalSales: currentSales + 1
       });
 
-      // 3. Log purchase record in /purchases collection
       const purchaseRef = db.collection('purchases').doc();
       transaction.set(purchaseRef, {
         userId: userId,
@@ -380,7 +380,6 @@ app.post('/product/purchase', authenticateUser, async (req, res) => {
         timestamp: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // 4. Log transaction record in /transactions collection
       const transactionRef = db.collection('transactions').doc();
       transaction.set(transactionRef, {
         transactionId: transactionRef.id,
@@ -420,7 +419,6 @@ app.post('/product/access', authenticateUser, async (req, res) => {
     const userData = userDoc.data();
     const purchasedProducts = userData.purchasedProducts || [];
 
-    // Verify ownership
     if (!purchasedProducts.includes(productId)) {
       return res.status(403).json({ success: false, error: 'Access denied: Product not purchased' });
     }
@@ -466,7 +464,6 @@ app.post('/wallet/withdraw', authenticateUser, async (req, res) => {
 
     const userRef = db.collection('users').doc(userId);
 
-    // Atomic transaction to lock funds and log pending withdrawal
     await db.runTransaction(async (transaction) => {
       const userDoc = await transaction.get(userRef);
       if (!userDoc.exists) {
@@ -480,12 +477,10 @@ app.post('/wallet/withdraw', authenticateUser, async (req, res) => {
         throw new Error('Insufficient wallet balance for withdrawal');
       }
 
-      // Deduct/lock amount from user's active wallet balance
       transaction.update(userRef, {
         wallet: currentWallet - amount
       });
 
-      // Log withdrawal request requiring admin approval
       const transactionRef = db.collection('transactions').doc();
       transaction.set(transactionRef, {
         transactionId: transactionRef.id,
@@ -556,4 +551,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Kit Digital96 Backend Server live on port ${PORT}`);
 });
-  
+        
